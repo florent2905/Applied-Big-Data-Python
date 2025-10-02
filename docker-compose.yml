@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  mariadb:
+    image: mariadb:11.1
+    container_name: mariadb_gold
+    environment:
+      MYSQL_ROOT_PASSWORD: "2003"
+      MYSQL_DATABASE: gold_db
+    ports:
+      - "3306:3306"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      timeout: 5s
+      retries: 10
+      interval: 3s
+
+  python_app:
+    build: .
+    container_name: python_gold_app
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      DB_HOST: mariadb
+      DB_USER: root
+      DB_PASSWORD: "2003"
+      DB_NAME: gold_db
+    volumes:
+      - ./main.py:/app/main.py
+
+volumes:
+  mariadb_data:
