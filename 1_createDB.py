@@ -2,7 +2,7 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import pandas as pd
 
-gold = yf.download("GC=F", start="1980-01-01", end="2025-09-01")
+gold = yf.download("GC=F", start="1980-01-01", end="2025-09-01", auto_adjust=False)
 gold = gold.reset_index()
 
 if 'index' in gold.columns:
@@ -103,14 +103,14 @@ def get_multiple_batches_gold(num_batches):
             start_date=current_date.strftime("%Y-%m-%d"),
             end_date=period_end.strftime("%Y-%m-%d"),
             num_records=250,
-            language="ENGLISH",
-            #domain=["bbc.co.uk", "lesechos.fr", "bloomberg.com", "lemonde.fr"],
-            keyword=["Gold price", "Gold investment", "Gold market"]  # Ajout du mot-clé pour l'or
+            language="english",
+            keyword=["Gold price", "Gold investment", "Gold market"]
         )
         filters_used.append(f)
 
         try:
             df_batch = gd.article_search(f)
+
             if not df_batch.empty:
                 all_articles.append(df_batch)
                 print(f"Batch {i+1} ({current_date.strftime('%Y-%m-%d')} à {period_end.strftime('%Y-%m-%d')}): {len(df_batch)} articles")
@@ -125,7 +125,9 @@ def get_multiple_batches_gold(num_batches):
         final_df = final_df.drop_duplicates(subset=['url'], keep='first')
         print(f"Total final après suppression doublons: {len(final_df)} articles")
         return gd, filters_used, final_df
+
     return None, [], pd.DataFrame()
+
 
 gd, filters_list, df = get_multiple_batches_gold(10)
 
@@ -134,6 +136,8 @@ f = filters_list [-1]
 
 articles = gd.article_search(f)
 timeline = gd.timeline_search("timelinevol", f)
+
+
 
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
@@ -234,12 +238,15 @@ import mariadb
 import pandas as pd
 import sqlalchemy
 
+import os
+
 DB_CONFIG = {
-    "host": "localhost",
-    "user": "root",           
-    "password": "2003",  
-    "database": "gold_db"
+    "host": os.getenv("DB_HOST", "localhost"),
+    "user": os.getenv("DB_USER", "root"),
+    "password": os.getenv("DB_PASSWORD", ""),
+    "database": os.getenv("DB_NAME", "gold_db")
 }
+
 
 # ...existing code...
 try:
@@ -252,13 +259,21 @@ except mariadb.Error as e:
 from sqlalchemy import create_engine
 
 # Connexion : user=root, mdp=root, base=panel_db
-engine = create_engine("mariadb+mariadbconnector://root:2003@localhost/gold_db")
+db_host = os.getenv("DB_HOST", "localhost")
+db_user = os.getenv("DB_USER", "root")
+db_password = os.getenv("DB_PASSWORD", "")
+db_name = os.getenv("DB_NAME", "gold_db")
+
+engine = create_engine(f"mariadb+mariadbconnector://{db_user}:{db_password}@{db_host}/{db_name}")
+
+
 
 # Supprimer les lignes contenant au moins un NaN
 df_clean = df.dropna()
 
 # Arrondir toutes les colonnes numériques à 2 décimales
 numeric_columns = df_clean.select_dtypes(include=['float64', 'float32', 'int64', 'int32']).columns
+df_clean = df_clean.copy()
 df_clean[numeric_columns] = df_clean[numeric_columns].round(2)
 
 # Insère dans la table 'gold_events'
