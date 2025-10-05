@@ -1,0 +1,414 @@
+# 2_modelisation.py
+"""
+Modélisation pour le projet Applied Big Data Analytics in Finance
+- Charge les données depuis la base MariaDB (gold_db.gold_events)
+- Utilise Target_Shock comme variable cible
+- Découpe temporel :
+    * In-sample : <= 2019-12-31 (avec split interne 1980-01-01 -> 2018-12-31 pour train, 2019 pour validation)
+    * Out-of-sample : >= 2020-01-01 (test final)
+- Modèles : Régression Logistique, RandomForest, XGBoost
+- Optimisation manuelle par boucles explicites (pas GridSearchCV)
+- Évaluations : ROC, AUC, Gini, matrice de confusion, classification report
+- Visualisations adaptées pour soutenance (seaborn + matplotlib)
+- Sauvegarde du meilleur modèle en joblib
+"""
+import ast
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import pandas as pd
+import numpy as np
+from sqlalchemy import create_engine
+
+# Modèles & utilitaires
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, classification_report, precision_recall_fscore_support
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+from datetime import datetime
+
+sns.set(style="whitegrid", context="talk")
+
+# -------------------------
+# 1. Chargement des données
+# =========================
+import pandas as pd
+from sqlalchemy import create_engine
+import os
+
+def load_data_from_db():
+    db_host = os.getenv("DB_HOST", "localhost")
+    db_user = os.getenv("DB_USER", "root")
+    db_password = os.getenv("DB_PASSWORD", "2003")
+    db_name = os.getenv("DB_NAME", "gold_db")
+
+    engine = create_engine(f"mariadb+mariadbconnector://{db_user}:{db_password}@{db_host}/{db_name}")
+    df = pd.read_sql("SELECT * FROM gold_events", con=engine)
+    print("✅ Données récupérées depuis gold_db.gold_events :")
+    print(df.shape)
+    return df
+
+df = load_data_from_db()
+print(df.columns.tolist())
+
+
+# -------------------------
+# 2) Préparation des données
+# -------------------------
+def prepare_data(df, target_col='Target_Shock'):
+    # Parse date
+    if 'Date' in df.columns:
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    else:
+        # try to find a date-like column
+        for c in df.columns:
+            if 'date' in c.lower():
+                df.rename(columns={c: 'Date'}, inplace=True)
+                df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+                break
+
+    # Keep only numeric columns + Date + target
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    # Ensure target exists
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found in dataframe.")
+    # Ensure target is integer 0/1
+    df[target_col] = pd.to_numeric(df[target_col], errors='coerce').fillna(0).astype(int)
+
+    # Remove target from feature list if present
+    if target_col in numeric_cols:
+        numeric_cols.remove(target_col)
+
+    # Remove index-like columns if present
+    for c in ['index', 'Unnamed: 0']:
+        if c in numeric_cols:
+            numeric_cols.remove(c)
+
+    # Features = all numeric columns (as requested)
+    features = numeric_cols.copy()
+
+    # Keep Date for splits
+    use_cols = ['Date'] + features + [target_col]
+    df_sub = df[use_cols].copy()
+
+    # Drop rows without Date or NaNs in target
+    df_sub = df_sub.dropna(subset=['Date', target_col])
+    # We'll drop rows with NaNs in features later (after splitting) to avoid data leakage
+
+    return df_sub, features
+
+# -------------------------
+# 3) Temporal split (in-sample / out-of-sample)
+# -------------------------
+def temporal_split(df, in_sample_end='2019-12-31'):
+    df = df.sort_values('Date').reset_index(drop=True)
+    in_sample_end = pd.to_datetime(in_sample_end)
+    train_val = df[df['Date'] <= in_sample_end].copy()
+    oos = df[df['Date'] > in_sample_end].copy()
+    print(f"In-sample (train+val) rows: {len(train_val)} | Out-of-sample rows: {len(oos)}")
+    return train_val, oos
+
+# Internal in-sample split: train up to 2018-12-31, val = 2019
+def in_sample_train_val_split(train_val_df, train_end='2018-12-31', val_start='2019-01-01', val_end='2019-12-31'):
+    train_end = pd.to_datetime(train_end)
+    val_start = pd.to_datetime(val_start)
+    val_end = pd.to_datetime(val_end)
+    train = train_val_df[train_val_df['Date'] <= train_end].copy()
+    val = train_val_df[(train_val_df['Date'] >= val_start) & (train_val_df['Date'] <= val_end)].copy()
+    print(f" - Train rows: {len(train)} | Validation rows: {len(val)}")
+    return train, val
+
+# -------------------------
+# 4) Utility: evaluate & plotting
+# -------------------------
+def compute_metrics_and_print(y_true, y_proba, threshold=0.5):
+    auc = roc_auc_score(y_true, y_proba)
+    gini = 2 * auc - 1
+    y_pred = (y_proba >= threshold).astype(int)
+    cm = confusion_matrix(y_true, y_pred)
+    report = classification_report(y_true, y_pred, digits=4)
+    acc = accuracy_score(y_true, y_pred)
+    prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
+    return {'auc': auc, 'gini': gini, 'cm': cm, 'report': report, 'accuracy': acc, 'precision': prec, 'recall': rec, 'f1': f1, 'y_pred': y_pred}
+
+def plot_roc_curves(results_dict, title="ROC - Comparaison modèles (Out-of-sample)"):
+    plt.figure(figsize=(8, 6))
+    for name, info in results_dict.items():
+        fpr, tpr, _ = roc_curve(info['y_true'], info['y_proba'])
+        auc = info['auc']
+        plt.plot(fpr, tpr, label=f"{name} (AUC = {auc:.3f})")
+    plt.plot([0,1],[0,1], linestyle='--', linewidth=1, label='Random')
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(title)
+    plt.legend(loc='lower right')
+    plt.tight_layout()
+    plt.show()
+
+def plot_confusion_matrix(cm, labels=[0,1], title="Matrice de confusion"):
+    plt.figure(figsize=(5,4))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False, xticklabels=labels, yticklabels=labels)
+    plt.xlabel("Prédit")
+    plt.ylabel("Vrai")
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+def plot_feature_importances(fi_series, title="Importance des variables"):
+    fi_series_sorted = fi_series.sort_values(ascending=False).head(20)
+    plt.figure(figsize=(8,6))
+    sns.barplot(x=fi_series_sorted.values, y=fi_series_sorted.index)
+    plt.title(title)
+    plt.xlabel("Importance")
+    plt.tight_layout()
+    plt.show()
+
+# -------------------------
+# 5 Modeling & manual optimization
+# -------------------------
+def manual_search_and_evaluate(X_train, y_train, X_val, y_val, X_oos, y_oos, features):
+    # We'll store best models and final oos evaluations
+    oos_results = {}
+    oos_preds_proba = {}
+    saved_models = {}
+
+    # Standard scaler for models that benefit (Logistic, XGB optionally)
+    scaler = StandardScaler()
+    scaler.fit(X_train)
+
+    # ========== 1) Logistic Regression ==========
+    print("\n--- Optimisation : Régression Logistique ---")
+    # Standardize features for logistic
+    X_train_s = pd.DataFrame(scaler.transform(X_train), columns=features)
+    X_val_s = pd.DataFrame(scaler.transform(X_val), columns=features)
+    X_oos_s = pd.DataFrame(scaler.transform(X_oos), columns=features)
+
+    best_auc = -np.inf
+    best_params = None
+    best_model = None
+
+    C_grid = [0.01, 0.1, 1, 10]
+    penalties = ['l2']  # keep simple and convex
+    for C in C_grid:
+        for pen in penalties:
+            try:
+                model = LogisticRegression(C=C, penalty=pen, solver='lbfgs', max_iter=1000)
+                model.fit(X_train_s, y_train)
+                proba = model.predict_proba(X_val_s)[:,1]
+                auc = roc_auc_score(y_val, proba)
+                print(f"LogReg C={C} penalty={pen} -> AUC val: {auc:.4f}")
+                if auc > best_auc:
+                    best_auc = auc
+                    best_params = {'C': C, 'penalty': pen}
+                    best_model = model
+            except Exception as e:
+                print("Erreur LogReg", e)
+
+    print(f"=> Best LogReg params: {best_params} | AUC val: {best_auc:.4f}")
+    # Refit on full in-sample (train+val)
+    X_full_in = pd.concat([X_train, X_val], axis=0)
+    y_full_in = pd.concat([y_train, y_val], axis=0)
+    X_full_in_s = pd.DataFrame(scaler.fit_transform(X_full_in), columns=features)
+    final_logreg = LogisticRegression(C=best_params['C'], penalty=best_params['penalty'], solver='lbfgs', max_iter=1000)
+    final_logreg.fit(X_full_in_s, y_full_in)
+    proba_oos = final_logreg.predict_proba(X_oos_s)[:,1]
+    metrics = compute_metrics_and_print(y_oos, proba_oos, threshold=0.5)
+    metrics.update({'y_true': y_oos.values, 'y_proba': proba_oos, 'auc': metrics['auc']})
+    oos_results['LogisticRegression'] = metrics
+    saved_models['LogisticRegression'] = final_logreg
+    print("LogReg OOS AUC:", metrics['auc'])
+
+    # ========== 2) Random Forest ==========
+    print("\n--- Optimisation : Random Forest ---")
+    # For RF, scaling not necessary
+    best_auc = -np.inf
+    best_params = None
+    best_model = None
+
+    n_estimators_grid = [50, 100, 200]
+    max_depth_grid = [3, 5, 8, None]
+    for n in n_estimators_grid:
+        for md in max_depth_grid:
+            try:
+                model = RandomForestClassifier(n_estimators=n, max_depth=md, random_state=42, n_jobs=-1)
+                model.fit(X_train, y_train)
+                proba = model.predict_proba(X_val)[:,1]
+                auc = roc_auc_score(y_val, proba)
+                print(f"RF n={n} max_depth={md} -> AUC val: {auc:.4f}")
+                if auc > best_auc:
+                    best_auc = auc
+                    best_params = {'n_estimators': n, 'max_depth': md}
+                    best_model = model
+            except Exception as e:
+                print("Erreur RF", e)
+
+    print(f"=> Best RF params: {best_params} | AUC val: {best_auc:.4f}")
+    # Refit on full in-sample
+    final_rf = RandomForestClassifier(n_estimators=best_params['n_estimators'],
+                                      max_depth=best_params['max_depth'],
+                                      random_state=42, n_jobs=-1)
+    final_rf.fit(X_full_in, y_full_in)
+    proba_oos = final_rf.predict_proba(X_oos)[:,1]
+    metrics = compute_metrics_and_print(y_oos, proba_oos, threshold=0.5)
+    metrics.update({'y_true': y_oos.values, 'y_proba': proba_oos, 'auc': metrics['auc']})
+    oos_results['RandomForest'] = metrics
+    saved_models['RandomForest'] = final_rf
+    print("RF OOS AUC:", metrics['auc'])
+
+    # ========== 3) XGBoost ==========
+    print("\n--- Optimisation : XGBoost ---")
+    best_auc = -np.inf
+    best_params = None
+    best_model = None
+
+    lr_grid = [0.01, 0.05, 0.1]
+    n_estimators_grid = [50, 100, 200]
+    max_depth_grid = [3, 5, 7]
+    for lr in lr_grid:
+        for n in n_estimators_grid:
+            for md in max_depth_grid:
+                try:
+                    model = XGBClassifier(n_estimators=n, max_depth=md, learning_rate=lr,
+                                          use_label_encoder=False, eval_metric='logloss', random_state=42, n_jobs=-1)
+                    model.fit(X_train, y_train)
+                    proba = model.predict_proba(X_val)[:,1]
+                    auc = roc_auc_score(y_val, proba)
+                    print(f"XGB lr={lr} n={n} md={md} -> AUC val: {auc:.4f}")
+                    if auc > best_auc:
+                        best_auc = auc
+                        best_params = {'learning_rate': lr, 'n_estimators': n, 'max_depth': md}
+                        best_model = model
+                except Exception as e:
+                    print("Erreur XGB", e)
+
+    print(f"=> Best XGB params: {best_params} | AUC val: {best_auc:.4f}")
+    # Refit on full in-sample
+    final_xgb = XGBClassifier(n_estimators=best_params['n_estimators'],
+                              max_depth=best_params['max_depth'],
+                              learning_rate=best_params['learning_rate'],
+                              use_label_encoder=False, eval_metric='logloss', random_state=42, n_jobs=-1)
+    final_xgb.fit(X_full_in, y_full_in)
+    proba_oos = final_xgb.predict_proba(X_oos)[:,1]
+    metrics = compute_metrics_and_print(y_oos, proba_oos, threshold=0.5)
+    metrics.update({'y_true': y_oos.values, 'y_proba': proba_oos, 'auc': metrics['auc']})
+    oos_results['XGBoost'] = metrics
+    saved_models['XGBoost'] = final_xgb
+    print("XGB OOS AUC:", metrics['auc'])
+
+    return oos_results, saved_models
+
+# -------------------------
+# 6) Run everything
+# -------------------------
+def main():
+    df_raw = load_data_from_db()
+    df_raw.columns = [
+    "_".join([str(c) for c in ast.literal_eval(col) if c]) 
+    for col in df_raw.columns
+]
+    df, features = prepare_data(df_raw, target_col='Target_Shock')
+
+    # Drop rows where all features are NaN
+    df = df.dropna(subset=features, how='all').reset_index(drop=True)
+
+    # Temporal split
+    train_val, oos = temporal_split(df, in_sample_end='2019-12-31')
+
+    # Further split in-sample into train (<=2018) and val (2019)
+    train, val = in_sample_train_val_split(train_val, train_end='2018-12-31', val_start='2019-01-01', val_end='2019-12-31')
+
+    # Drop rows with NaNs in features inside each split (to avoid leakage)
+    train = train.dropna(subset=features)
+    val = val.dropna(subset=features)
+    oos = oos.dropna(subset=features)
+
+    # Prepare X/y
+    X_train = train[features].reset_index(drop=True)
+    y_train = train['Target_Shock'].reset_index(drop=True)
+    X_val = val[features].reset_index(drop=True)
+    y_val = val['Target_Shock'].reset_index(drop=True)
+    X_oos = oos[features].reset_index(drop=True)
+    y_oos = oos['Target_Shock'].reset_index(drop=True)
+
+    print("\nFeatures used:", len(features))
+    print(features)
+
+    # If any splits are empty, warn and exit
+    if len(X_train)==0 or len(X_val)==0 or len(X_oos)==0:
+        raise ValueError("Un des splits (train / val / out-of-sample) est vide. Vérifie les dates et les données.")
+
+    # Manual search + final OOS evaluation
+    results, models = manual_search_and_evaluate(X_train, y_train, X_val, y_val, X_oos, y_oos, features)
+
+    # -------------------------
+    # Visualisations and summary
+    # -------------------------
+    # ROC comparison
+    combined = {}
+    for name, info in results.items():
+        combined[name] = {'y_true': info['y_true'], 'y_proba': info['y_proba'], 'auc': info['auc']}
+
+    plot_roc_curves(combined, title="ROC - Comparaison modèles (Out-of-sample)")
+
+    # Print metrics table
+    summary_rows = []
+    for name, info in results.items():
+        summary_rows.append({
+            'model': name,
+            'AUC': info['auc'],
+            'Gini': info['gini'],
+            'Accuracy': info['accuracy'],
+            'Precision': info['precision'],
+            'Recall': info['recall'],
+            'F1': info['f1']
+        })
+    summary_df = pd.DataFrame(summary_rows).sort_values('AUC', ascending=False).reset_index(drop=True)
+    print("\n=== Tableau récapitulatif (Out-of-sample) ===")
+    print(summary_df)
+
+    # Plot confusion matrices and reports for each model
+    for name, info in results.items():
+        print(f"\n--- {name} ---")
+        print("AUC:", info['auc'])
+        print("Gini:", info['gini'])
+        print("Accuracy:", info['accuracy'])
+        print("Classification report:\n", info['report'])
+        plot_confusion_matrix(info['cm'], labels=[0,1], title=f"Matrice de confusion - {name}")
+
+    # Feature importances for RF & XGB
+    if 'RandomForest' in models:
+        rf = models['RandomForest']
+        fi = pd.Series(rf.feature_importances_, index=features)
+        plot_feature_importances(fi, title="Importance variables - RandomForest")
+
+    if 'XGBoost' in models:
+        xgb = models['XGBoost']
+        try:
+            fi = pd.Series(xgb.feature_importances_, index=features)
+            plot_feature_importances(fi, title="Importance variables - XGBoost")
+        except Exception as e:
+            print("Impossible d'extraire feature importances XGBoost:", e)
+
+    # Save best model (by AUC)
+    best_model_name = summary_df.loc[0, 'model']
+    best_model = models[best_model_name]
+    joblib.dump(best_model, "best_model.joblib")
+    print(f"\n✅ Meilleur modèle sauvegardé : {best_model_name} -> best_model.joblib")
+
+    # Save summary table CSV for inclusion dans la présentation
+    summary_df.to_csv("model_summary_oos.csv", index=False)
+    print("✅ Tableau récapitulatif enregistré : model_summary_oos.csv")
+
+if __name__ == "__main__":
+    main()
+
+
+

@@ -283,3 +283,8 @@ try:
 except Exception as e:
     print("Erreur lors de l'insertion :", e)
 # ...existing code...
+
+# Export du DataFrame dans MySQL (remplace si existe déjà)
+df.to_sql("gold_events", con=engine, if_exists="replace", index=False)
+
+print("✅ DataFrame exporté dans la base gold_db (table : gold_events)")
